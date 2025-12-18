@@ -19,7 +19,7 @@ from .renderer import RenderClient
     "web_analysis",
     "YEZI",
     "网页分析 Pro：静态抓取+动态渲染+LLM深度分析",
-    "0.4.0", # 版本升级
+    "0.4.0", 
     "https://github.com/yezi-ai/astrbot_plugin_web_analysis",
 )
 class WebAnalysisPlugin(Star):
@@ -236,6 +236,10 @@ class WebAnalysisPlugin(Star):
             call_kwargs["model"] = self.cfg.get("llm_model")
         if self.cfg.get("llm_base_url"):
             call_kwargs["base_url"] = self.cfg.get("llm_base_url")
+        # [新增] 注入 API KEY
+        if self.cfg.get("llm_api_key"):
+            call_kwargs["api_key"] = self.cfg.get("llm_api_key")
+            
         if self.cfg.get("llm_timeout_sec"):
              call_kwargs["timeout"] = float(self.cfg.get("llm_timeout_sec"))
 
