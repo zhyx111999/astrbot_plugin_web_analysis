@@ -93,12 +93,17 @@
     "default": true
   },
   "llm_model": {
-    "description": "LLM模型名（留空则使用全局默认）",
+    "description": "模型名",
     "type": "string",
     "default": ""
   },
   "llm_base_url": {
-    "description": "LLM中转Base URL（留空则使用全局默认）",
+    "description": "URL",
+    "type": "string",
+    "default": ""
+  },
+  "llm_api_key": {
+    "description": "KEY",
     "type": "string",
     "default": ""
   },
