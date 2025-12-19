@@ -1,5 +1,6 @@
 import httpx
 import os
+import json
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
@@ -10,7 +11,7 @@ from .cache import DiskCache
 from .utils import extract_urls
 from pathlib import Path
 
-@register("web_analysis_pro", "YEZI", "深度网页解析Pro", "0.4.2") # 升级版本号
+@register("web_analysis_pro", "YEZI", "深度网页解析Pro", "0.4.3")
 class WebAnalysisPlugin(Star):
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
@@ -27,7 +28,7 @@ class WebAnalysisPlugin(Star):
         if config.get("render_mode") != "never":
             self.render_client = RenderClient(config)
             
-        # [修复1] 获取配置时指定默认类型，防止 AttributeError
+        # [安全防御] 获取配置时指定默认类型，防止 AttributeError
         site_rules = self._parse_json_config("site_rules_json", default=[])
         domain_rules = self._parse_json_config("domain_rules_json", default={})
         
@@ -43,15 +44,14 @@ class WebAnalysisPlugin(Star):
             domain_rules={
                 "site_rules": site_rules,
                 "allow": [], 
-                "deny": domain_rules.get("deny", []) # 现在安全了
+                "deny": domain_rules.get("deny", [])
             },
             cache=self.disk_cache,
             render_client=self.render_client
         )
 
-    # [修复1] 增加 default 参数，增强健壮性
+    # [安全防御] 增加 default 参数，增强健壮性
     def _parse_json_config(self, key, default=None):
-        import json
         if default is None:
             default = []
         try:
@@ -99,7 +99,7 @@ class WebAnalysisPlugin(Star):
                 
                 await event.send(event.chain_result(chain))
 
-                # [修复2] 发送完成后清理临时截图文件，防止磁盘泄露
+                # [安全防御] 发送完成后清理临时截图文件，防止磁盘泄露
                 if result.screenshot_path:
                     try:
                         os.remove(result.screenshot_path)
@@ -122,7 +122,7 @@ class WebAnalysisPlugin(Star):
 
         if custom_key and custom_base:
             try:
-                # [Iron Rule] 使用独立配置调用 OpenAI 兼容接口，必须配置超时
+                # [规范] 使用独立配置调用 OpenAI 兼容接口，必须配置超时
                 async with httpx.AsyncClient(timeout=60) as client:
                     payload = {
                         "model": custom_model or "gpt-3.5-turbo",
