@@ -50,21 +50,21 @@
     "default": 2
   },
   "site_rules_json": {
-    "description": "特殊站点规则(JSON数组)，可针对特定域名设置等待选择器等。",
+    "description": "特殊站点规则(JSON数组)",
     "type": "text",
     "default": "[]",
     "editor_mode": true,
     "editor_language": "json"
   },
   "domain_rules_json": {
-    "description": "域名名单(JSON对象)。allow为白名单，deny为黑名单(默认已屏蔽视频站)。",
+    "description": "域名名单(JSON对象)",
     "type": "text",
     "default": "{\"allow\": [], \"deny\": [\"bilibili.com\", \"b23.tv\", \"douyin.com\", \"iesdouyin.com\", \"kuaishou.com\", \"gifshow.com\", \"youtube.com\"]}",
     "editor_mode": true,
     "editor_language": "json"
   },
   "cookies_json": {
-    "description": "自定义Cookies(JSON数组)，用于需要登录的站点。",
+    "description": "自定义Cookies(JSON数组)",
     "type": "text",
     "default": "[]",
     "editor_mode": true,
@@ -93,44 +93,34 @@
     "default": true
   },
   "llm_model": {
-    "description": "模型名",
+    "description": "独立LLM模型名（留空则使用Bot默认）",
     "type": "string",
     "default": ""
   },
   "llm_base_url": {
-    "description": "URL",
+    "description": "独立LLM Base URL（留空则使用Bot默认）",
     "type": "string",
     "default": ""
   },
   "llm_api_key": {
-    "description": "KEY",
+    "description": "独立LLM Key（留空则使用Bot默认）",
     "type": "string",
     "default": ""
-  },
-  "llm_timeout_sec": {
-    "description": "LLM调用超时（秒）",
-    "type": "float",
-    "default": 60
   },
   "analysis_prompt_template": {
     "description": "分析提示词任务说明",
     "type": "string",
-    "default": "请阅读以下网页内容，并完成以下任务：\n1. 【站点性质判断】分析该网页的功能（如：新闻/博客/钓鱼网站/后台/论坛等）。\n2. 【内容摘要】总结核心信息，忽略广告和无关干扰。\n"
+    "default": "请阅读以下网页内容，并完成以下任务：\n1. 【站点性质判断】分析该网页的功能。\n2. 【内容摘要】总结核心信息。"
   },
   "analysis_prompt_user_persona": {
-    "description": "风格要求（强烈建议填入：请保持你现在的AI人设语气进行回答）",
+    "description": "风格要求",
     "type": "string",
-    "default": "请务必保持你作为当前AI助手的人设语气（不要变成无情的摘要机器），用你的口吻向用户汇报分析结果。如果内容有安全风险，请用警告的语气。"
-  },
-  "screenshot_enabled": {
-    "description": "是否启用截图链路（默认关闭，开启需要 playwrought）",
-    "type": "bool",
-    "default": false
+    "default": "请务必保持你作为当前AI助手的人设语气。"
   },
   "screenshot_mode": {
-    "description": "截图模式：off=关闭; on_failure=仅当LLM失败时发图; always=总是发图",
+    "description": "截图模式：off=关闭; always=总是截图",
     "type": "string",
     "default": "off",
-    "options": ["off", "on_failure", "always"]
+    "options": ["off", "always"]
   }
 }
