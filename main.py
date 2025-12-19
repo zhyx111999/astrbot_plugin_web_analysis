@@ -1,4 +1,5 @@
 import httpx
+import os
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
@@ -9,7 +10,7 @@ from .cache import DiskCache
 from .utils import extract_urls
 from pathlib import Path
 
-@register("web_analysis_pro", "YEZI", "深度网页解析Pro", "0.4.1")
+@register("web_analysis_pro", "YEZI", "深度网页解析Pro", "0.4.2") # 升级版本号
 class WebAnalysisPlugin(Star):
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
@@ -26,6 +27,10 @@ class WebAnalysisPlugin(Star):
         if config.get("render_mode") != "never":
             self.render_client = RenderClient(config)
             
+        # [修复1] 获取配置时指定默认类型，防止 AttributeError
+        site_rules = self._parse_json_config("site_rules_json", default=[])
+        domain_rules = self._parse_json_config("domain_rules_json", default={})
+        
         # 初始化核心分析器
         self.analyzer = WebAnalyzerCore(
             http_settings={
@@ -36,23 +41,28 @@ class WebAnalysisPlugin(Star):
             },
             render_settings=config,
             domain_rules={
-                "site_rules": self._parse_json_config("site_rules_json"),
+                "site_rules": site_rules,
                 "allow": [], 
-                "deny": self._parse_json_config("domain_rules_json").get("deny", [])
+                "deny": domain_rules.get("deny", []) # 现在安全了
             },
             cache=self.disk_cache,
             render_client=self.render_client
         )
 
-    def _parse_json_config(self, key):
+    # [修复1] 增加 default 参数，增强健壮性
+    def _parse_json_config(self, key, default=None):
         import json
+        if default is None:
+            default = []
         try:
-            val = self.config.get(key, "[]")
+            val = self.config.get(key)
+            if not val:
+                return default
             if isinstance(val, str):
                 return json.loads(val)
             return val
         except:
-            return []
+            return default
 
     # 注册 URL 监听
     @filter.event_message_type(filter.EventMessageType.ALL)
@@ -69,15 +79,12 @@ class WebAnalysisPlugin(Star):
         for url in urls:
             logger.info(f"[WebAnalysis] Processing: {url}")
             
-            # 1. 抓取与提取
-            # [Fix] 统一使用 screenshot_mode 判断
             sc_mode = self.config.get("screenshot_mode", "off")
             need_screenshot = (sc_mode == "always")
             
             result = await self.analyzer.fetch_and_extract(url, need_screenshot=need_screenshot)
             
             if result.error:
-                # 如果是静默失败模式可以 log warning，这里直接 log error
                 logger.warning(f"Analysis failed: {result.error}")
                 continue
                 
@@ -90,7 +97,15 @@ class WebAnalysisPlugin(Star):
                 if result.screenshot_path:
                     chain.append(Image.fromFileSystem(result.screenshot_path))
                 
-                yield event.chain_result(chain)
+                await event.send(event.chain_result(chain))
+
+                # [修复2] 发送完成后清理临时截图文件，防止磁盘泄露
+                if result.screenshot_path:
+                    try:
+                        os.remove(result.screenshot_path)
+                        logger.debug(f"[WebAnalysis] Cleaned up screenshot: {result.screenshot_path}")
+                    except Exception as e:
+                        logger.warning(f"Failed to cleanup screenshot: {e}")
 
     async def _llm_summarize(self, result):
         """
@@ -106,9 +121,9 @@ class WebAnalysisPlugin(Star):
         custom_model = self.config.get("llm_model")
 
         if custom_key and custom_base:
-            # [Iron Rule] 使用独立配置调用 OpenAI 兼容接口
             try:
-                async with httpx.AsyncClient(timeout=self.config.get("llm_timeout_sec", 60)) as client:
+                # [Iron Rule] 使用独立配置调用 OpenAI 兼容接口，必须配置超时
+                async with httpx.AsyncClient(timeout=60) as client:
                     payload = {
                         "model": custom_model or "gpt-3.5-turbo",
                         "messages": [
@@ -117,7 +132,7 @@ class WebAnalysisPlugin(Star):
                         ]
                     }
                     resp = await client.post(
-                        f"{custom_base.rstrip('/')}/v1/chat/completions", # 假设是兼容 OpenAI 的接口
+                        f"{custom_base.rstrip('/')}/v1/chat/completions",
                         json=payload,
                         headers={"Authorization": f"Bearer {custom_key}"}
                     )
@@ -126,7 +141,6 @@ class WebAnalysisPlugin(Star):
                     return data["choices"][0]["message"]["content"]
             except Exception as e:
                 logger.error(f"[WebAnalysis] Custom LLM failed: {e}, falling back to system provider.")
-                # 失败后继续向下执行，尝试使用系统默认 Provider
         
         # 使用 AstrBot 全局 Provider
         provider = self.context.get_using_provider()
