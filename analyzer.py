@@ -17,7 +17,7 @@ class FetchResult:
     text: str
     used_renderer: bool
     error: str = ""
-    screenshot_path: Optional[str] = None  # [新增] 截图路径
+    screenshot_path: Optional[str] = None
 
 class WebAnalyzerCore:
     def __init__(self, http_settings, render_settings, domain_rules, cache, render_client):
@@ -51,21 +51,17 @@ class WebAnalyzerCore:
             self._client = None
 
     def _domain_allowed(self, url: str) -> bool:
-        # [关键修复] 计划1: 修复黑名单无效问题
         try:
             dom = urlparse(url).netloc.lower()
-            # 修正：Schema 中的 key 是 "allow" 和 "deny"，不是 "allow_domains"
-            allow_list = self.domain_rules.get("allow") or self.domain_rules.get("allow_domains") or []
-            deny_list = self.domain_rules.get("deny") or self.domain_rules.get("deny_domains") or []
+            allow_list = self.domain_rules.get("allow") or []
+            deny_list = self.domain_rules.get("deny") or []
             
             allow = set([d.lower() for d in allow_list if d])
             deny  = set([d.lower() for d in deny_list if d])
             
-            # 黑名单优先
             if deny and any(dom == d or dom.endswith("." + d) for d in deny):
                 return False
             
-            # 白名单模式
             if allow:
                 return any(dom == d or dom.endswith("." + d) for d in allow)
             
@@ -82,7 +78,7 @@ class WebAnalyzerCore:
                 error="域名被规则拦截 (黑名单)"
             )
 
-        # 缓存逻辑 (注意：如果是截图模式，暂时跳过缓存或需升级缓存结构，这里简化为截图时不读缓存文本)
+        # 缓存逻辑 (截图模式跳过缓存)
         cache_key = f"fetch::{url}"
         if self.cache and not need_screenshot:
             cached = self.cache.get(cache_key)
@@ -110,6 +106,7 @@ class WebAnalyzerCore:
             status = resp.status_code
             final_url = str(resp.url)
             
+            # 静态抓取的基础清洗
             doc = Document(text)
             title = doc.short_title()
             content = doc.summary()
@@ -118,34 +115,36 @@ class WebAnalyzerCore:
             used_renderer = False
             screenshot_path = None
 
-            # 决定是否使用渲染器 (SPA检测 OR 强制截图)
+            # 决定是否使用渲染器
             should_render = False
             if self.render_client:
-                # 如果开启了截图，必须走渲染器
                 if need_screenshot:
                     should_render = True
-                # 或者是 SPA 页面
                 elif looks_like_shell_html(text):
                     should_render = True
-                # 或者配置强制渲染 (always)
                 elif self.render_settings.get("render_mode") == "always":
                     should_render = True
 
             if should_render and self.render_client:
                  try:
-                     # [变更] 传递 screenshot 标记
-                     r_title, r_text, s_path = await self.render_client.render_extract(final_url, screenshot=need_screenshot)
+                     # [优化] 获取 HTML 源码和截图
+                     r_title, r_html, s_path = await self.render_client.render_extract(final_url, screenshot=need_screenshot)
                      
                      if s_path:
                          screenshot_path = s_path
                      
-                     # 只有文本更丰富时才替换文本，但截图是必须保留的
-                     if len(r_text) > len(clean_text) or not clean_text:
-                         clean_text = r_text
-                         title = r_title if r_title else title
-                         used_renderer = True
+                     # [优化] 对渲染出来的 HTML 进行 Readability 清洗，而不是直接用 innerText
+                     if r_html:
+                         doc_r = Document(r_html)
+                         summary_r = doc_r.summary()
+                         r_clean_text = BeautifulSoup(summary_r, "lxml").get_text("\n", strip=True)
+                         
+                         # 如果渲染并清洗后的文本有效，则采纳
+                         if len(r_clean_text) > 100 or (not clean_text and r_clean_text):
+                             clean_text = r_clean_text
+                             title = r_title if r_title else title
+                             used_renderer = True
                  except Exception as e:
-                     # 如果仅仅是截图失败，不要导致整个流程崩溃，但如果是渲染器崩了，就回退到静态
                      print(f"[WebAnalysis] Render/Screenshot fail: {e}")
 
             res = FetchResult(
@@ -154,7 +153,7 @@ class WebAnalyzerCore:
                 screenshot_path=screenshot_path
             )
             
-            # 仅缓存纯文本结果，带截图的通常是一次性的不缓存
+            # 仅缓存纯文本结果
             if self.cache and not screenshot_path:
                 self.cache.set(cache_key, res.__dict__)
             return res
