@@ -48,7 +48,8 @@ class RenderClient:
 
     async def render_extract(self, url: str, screenshot: bool = False) -> tuple[str, str, str | None]:
         """
-        返回: (title, text, screenshot_path)
+        返回: (title, html_content, screenshot_path)
+        注意：这里返回的是 HTML 源码，交给 Analyzer 进行清洗
         """
         await self.startup()
         assert self._browser is not None
@@ -62,7 +63,7 @@ class RenderClient:
             context = await self._browser.new_context(
                 extra_http_headers=self.settings.get("extra_headers") or {},
                 user_agent=ua,
-                viewport={"width": 1280, "height": 720} if screenshot else None # 截图需要视窗
+                viewport={"width": 1280, "height": 720} if screenshot else None
             )
             
             cookies = self.settings.get("cookies") or []
@@ -88,22 +89,20 @@ class RenderClient:
                 try: title = await page.title()
                 except Exception: pass
 
-                # 提取文本
-                text = await page.evaluate("() => document.body ? document.body.innerText : ''")
+                # [优化] 获取完整 HTML 而不是 innerText，以便后续清洗
+                html_content = await page.content()
                 
-                # [计划2] 实现截图
                 if screenshot:
                     try:
-                        # 生成临时文件路径
                         tmp_dir = tempfile.gettempdir()
                         fname = f"astrbot_web_{int(time.time()*1000)}.png"
                         path = os.path.join(tmp_dir, fname)
-                        await page.screenshot(path=path, full_page=False) # 全屏容易过长，截首屏即可
+                        await page.screenshot(path=path, full_page=False)
                         screenshot_path = path
                     except Exception as e:
                         print(f"[WebAnalysis] Screenshot error: {e}")
 
-                return (title or ""), (text or "").strip(), screenshot_path
+                return (title or ""), (html_content or ""), screenshot_path
             
             except Exception as e:
                 raise e
