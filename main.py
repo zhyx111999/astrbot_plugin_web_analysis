@@ -1,254 +1,213 @@
-from __future__ import annotations
-
-import json
-import os
-from pathlib import Path
-from typing import Optional, Dict, Any
-
 from astrbot.api.event import filter, AstrMessageEvent
-from astrbot.api.star import Context, Star, register, StarTools
+from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
-import astrbot.api.message_components as Comp # 引入组件用于发图
+from astrbot.api.message_components import Image, Plain
+import random
+import re
 
-from .utils import extract_urls, truncate
-from .cache import DiskCache
-from .analyzer import WebAnalyzerCore
-from .renderer import RenderClient
-
-@register(
-    "web_analysis",
-    "YEZI",
-    "网页分析 Pro：静态抓取+动态渲染+LLM深度分析",
-    "0.4.0", 
-    "https://github.com/yezi-ai/astrbot_plugin_web_analysis",
-)
-class WebAnalysisPlugin(Star):
-    def __init__(self, context: Context, config: Dict[str, Any] = None):
+@register("image_guard", "YEZI", "图片内容审查卫士", "1.7.4")
+class ImageGuard(Star):
+    def __init__(self, context: Context, config: dict):
         super().__init__(context)
-        self.config = config or {}
-        self.cfg = self.config
+        self.config = config
 
-        data_dir = Path(StarTools.get_data_dir())
-        self._cache = None
-        if self.cfg.get("enable_cache", True):
-            self._cache = DiskCache(
-                cache_dir=data_dir / "cache",
-                ttl_sec=self.cfg.get("cache_ttl_sec", 3600)
-            )
-
-        def _parse_json_cfg(key, default):
-            raw = self.cfg.get(key)
-            if not raw: return default
-            if isinstance(raw, str):
-                try: return json.loads(raw)
-                except: return default
-            return raw
-
-        extra_headers = _parse_json_cfg("extra_headers_json", {})
-        cookies = _parse_json_cfg("cookies_json", [])
-        site_rules = _parse_json_cfg("site_rules_json", [])
-        domain_rules = _parse_json_cfg("domain_rules_json", {})
-
-        self._renderer = None
-        render_mode = self.cfg.get("render_mode", "auto")
-        if render_mode != "never":
-            self._renderer = RenderClient({
-                "max_render_concurrency": self.cfg.get("max_render_concurrency", 2),
-                "render_timeout_ms": self.cfg.get("render_timeout_ms", 20000),
-                "wait_until": "networkidle",
-                "user_agent": self.cfg.get("http_user_agent"),
-                "proxy": self.cfg.get("http_proxy"),
-                "extra_headers": extra_headers,
-                "cookies": cookies,
-                "site_rules": site_rules,
-            })
-
-        self._core = WebAnalyzerCore(
-            http_settings={
-                "timeout_sec": self.cfg.get("http_timeout_sec", 15),
-                "retry_times": 2,
-                "proxy": self.cfg.get("http_proxy"),
-                "user_agent": self.cfg.get("http_user_agent"),
-            },
-            render_settings={
-                "render_mode": render_mode,
-                "enable_render_fallback": True,
-                "min_text_length_to_skip_render": self.cfg.get("min_text_length_to_skip_render", 200),
-            },
-            domain_rules=domain_rules,
-            cache=self._cache,
-            render_client=self._renderer,
-        )
-        logger.info(f"[WebAnalysis] Loaded v0.4.0")
-
-    @filter.on_astrbot_loaded()
-    async def on_startup(self):
-        try:
-            await self._core.startup()
-            if self._renderer:
-                await self._renderer.startup()
-        except Exception as e:
-            logger.error(f"[WebAnalysis] Startup failed: {e}")
-
-    async def terminate(self):
-        await self._core.shutdown()
-        if self._renderer:
-            await self._renderer.shutdown()
-
-    @filter.command("web")
-    async def web_cmd(self, event: AstrMessageEvent, sub: str = "", arg: str = ""):
-        sub = (sub or "").lower().strip()
-        arg = (arg or "").strip()
-
-        if sub == "analyze":
-            if not arg:
-                yield event.plain_result("请提供 URL。")
-                return
-            async for res in self._process_url(event, arg):
-                yield res
-
-        elif sub == "diag":
-            if not arg:
-                yield event.plain_result("请提供 URL。")
-                return
-            fr = await self._core.fetch_and_extract(arg, need_screenshot=True) # 诊断强制截图
-            info = (
-                f"🛠️ 诊断报告\nURL: {fr.final_url}\nCode: {fr.status_code}\nTitle: {fr.title}\n"
-                f"Len: {len(fr.text)}\nRender: {fr.used_renderer}\n"
-                f"Screenshot: {'Yes' if fr.screenshot_path else 'No'}\nError: {fr.error}"
-            )
-            # 发送图文
-            chain = [Comp.Plain(info)]
-            if fr.screenshot_path:
-                chain.append(Comp.Image.fromFileSystem(fr.screenshot_path))
-            yield event.chain_result(chain)
-
-        elif sub == "cache" and arg == "clear":
-            if self._cache:
-                count = self._cache.clear()
-                yield event.plain_result(f"已清除 {count} 个缓存文件。")
-            else:
-                yield event.plain_result("缓存未启用。")
-        else:
-            yield event.plain_result("指令错误。可用: analyze, diag, cache clear")
-
+    # [关键修改] 增加 *args 以兼容框架传入的额外参数
     @filter.event_message_type(filter.EventMessageType.ALL)
-    async def on_message(self, event: AstrMessageEvent):
-        if not self.cfg.get("enable_auto_detect", True):
-            return
-        text = event.message_str or ""
-        if text.startswith(("/", "#", "！")):
-            return
+    async def on_image_message(self, event: AstrMessageEvent, *args):
+        # === 1. 范围控制逻辑 ===
+        group_id = event.get_group_id() or ""
+        user_id = event.get_sender_id() or ""
+        is_group = bool(group_id)
 
-        urls = extract_urls(text, limit=self.cfg.get("max_urls_per_message", 1))
-        if not urls:
-            return
-        
-        for url in urls:
-            async for res in self._process_url(event, url):
-                yield res
+        group_scope = [str(x) for x in self.config.get("group_scope", ["0"])]
+        private_scope = [str(x) for x in self.config.get("private_scope", [])]
 
-    async def _process_url(self, event: AstrMessageEvent, url: str):
-        # 判断是否需要截图
-        screenshot_enabled = self.cfg.get("screenshot_enabled", False)
-        screenshot_mode = self.cfg.get("screenshot_mode", "off")
-        need_screenshot = screenshot_enabled and (screenshot_mode in ["always", "on_failure"])
+        if is_group:
+            if "0" not in group_scope and group_id not in group_scope: return
+        else:
+            if "0" not in private_scope and user_id not in private_scope: return
 
-        fr = await self._core.fetch_and_extract(url, need_screenshot=need_screenshot)
-
-        if fr.error and not fr.text.strip():
-            if "黑名单" in fr.error:
-                logger.info(f"[WebAnalysis] Ignored blacklisted: {url}")
-                return
-            logger.warning(f"[WebAnalysis] Fetch failed: {fr.error}")
-            return
-
-        # 基础信息头
-        base_info = (
-            f"📄 {fr.title or '网页快照'}\n"
-            f"🔗 {fr.final_url}\n"
-            f"{'-'*20}\n"
-        )
-        
-        # 构建消息链
-        chain = []
-
-        # 1. 如果有截图，优先放图
-        if fr.screenshot_path:
-             chain.append(Comp.Image.fromFileSystem(fr.screenshot_path))
-
-        # 2. 如果不使用 LLM，直接发截断原文
-        if not self.cfg.get("enable_llm", True):
-            chain.append(Comp.Plain(base_info + truncate(fr.text, 500)))
-            yield event.chain_result(chain)
-            return
-
-        # 3. 使用 LLM 进行分析
+        # === 2. 表情包与GIF强过滤 (Sticker Filter) ===
         try:
-            summary = await self._call_llm(fr.text)
-            chain.append(Comp.Plain(base_info + summary))
-            yield event.chain_result(chain)
-        except Exception as e:
-            logger.error(f"[WebAnalysis] LLM Error: {e}")
-            chain.append(Comp.Plain(base_info + f"⚠️ 分析失败: {e}\n" + truncate(fr.text, 200)))
-            yield event.chain_result(chain)
-
-        # 清理截图临时文件
-        if fr.screenshot_path:
-            try: os.remove(fr.screenshot_path)
-            except: pass
-
-    async def _call_llm(self, text: str) -> str:
-        provider = self.context.get_using_provider()
-        
-        # 尝试获取默认 Provider
-        if not provider and hasattr(self.context, "provider_manager"):
-            pm = self.context.provider_manager
-            if getattr(pm, "default_provider_id", None):
-                provider = self.context.get_provider_by_id(pm.default_provider_id)
-        
-        if not provider:
-            raise RuntimeError("未配置或未启用 LLM 服务")
-
-        max_len = 12000 
-        content_truncated = truncate(text, max_len)
-        
-        # [计划3] 人格化改造
-        # 不再使用 system_prompt 参数覆盖，而是拼接到 user prompt
-        # 让 LLM 保持原有的人设 (AstrBot System Prompt)，同时执行新任务
-        
-        tpl = self.cfg.get("analysis_prompt_template", "")
-        persona_instruction = self.cfg.get("analysis_prompt_user_persona", "")
-        
-        # 组装 Prompt
-        # 格式：[任务说明] + [风格要求] + [网页内容]
-        full_user_prompt = f"{tpl}\n\n【风格要求】\n{persona_instruction}\n\n【网页内容】\n{content_truncated}"
-        
-        call_kwargs = {
-            "prompt": full_user_prompt,
-            "session_id": None, 
-            "contexts": [],
-            "image_urls": []
-        }
-
-        # 注入配置
-        if self.cfg.get("llm_model"):
-            call_kwargs["model"] = self.cfg.get("llm_model")
-        if self.cfg.get("llm_base_url"):
-            call_kwargs["base_url"] = self.cfg.get("llm_base_url")
-        # [新增] 注入 API KEY
-        if self.cfg.get("llm_api_key"):
-            call_kwargs["api_key"] = self.cfg.get("llm_api_key")
+            raw_chain = []
+            if hasattr(event, "message") and isinstance(event.message, list):
+                raw_chain = event.message
+            elif hasattr(event, "original_event") and hasattr(event.original_event, "message"):
+                raw_chain = event.original_event.message
             
-        if self.cfg.get("llm_timeout_sec"):
-             call_kwargs["timeout"] = float(self.cfg.get("llm_timeout_sec"))
+            for seg in raw_chain:
+                if isinstance(seg, dict) and seg.get("type") == "image":
+                    data = seg.get("data", {})
+                    sub_type = int(data.get("sub_type", 0))
+                    if sub_type != 0:
+                        return # 忽略表情包
+        except Exception:
+            pass 
 
-        # 严禁使用 invoke/inspect，必须使用 text_chat
-        response = await provider.text_chat(**call_kwargs)
+        # === 3. 提取图片 URL 并过滤 GIF ===
+        message_obj = event.message_obj
+        if not message_obj.message: return
+            
+        image_urls = []
+        for component in message_obj.message:
+            if isinstance(component, Image):
+                if component.url:
+                    clean_url = component.url.split('?')[0].lower()
+                    if clean_url.endswith('.gif'):
+                        continue
+                    image_urls.append(component.url)
+        
+        if not image_urls: return
 
-        if response and response.completion_text:
-            return response.completion_text.strip()
-        if response and hasattr(response, "raw_completion"):
-             return str(response.raw_completion)
-             
-        raise RuntimeError("LLM 返回内容为空")
+        # === 4. 概率抽查 ===
+        if random.random() > self.config.get("check_probability", 1.0): return
+
+        # === 5. 检查配置 ===
+        forbidden_texts = self.config.get("sensitive_texts", [])
+        forbidden_descs = self.config.get("forbidden_descriptions", [])
+        if not forbidden_texts and not forbidden_descs: return
+
+        # === 6. 构建 Prompt ===
+        custom_instruction = self.config.get("custom_vision_prompt", "")
+        prompt = (
+            "你是一个严格但公正的内容审核员。请分析图片是否包含违规信息。\n"
+            f"【自定义关注点】\n{custom_instruction}\n\n"
+            "【违规标准】\n"
+            f"1. 包含文字：{str(forbidden_texts)}\n"
+            f"2. 包含画面：{str(forbidden_descs)}\n\n"
+            "【输出格式要求】\n"
+            "请严格按照以下两行格式输出，不要包含其他废话：\n"
+            "REASON: [这里简要说明判断理由，不超过20字]\n"
+            "RESULT: [SAFE 或 VIOLATION]\n\n"
+            "【注意】\n"
+            "只有在你**非常确定**图片包含上述违规元素时才返回 VIOLATION。\n"
+            "如果是模棱两可的情况，请倾向于返回 SAFE，避免误判。"
+        )
+
+        try:
+            # === 7. 获取 Provider ===
+            provider = self.context.get_using_provider()
+            if not provider and hasattr(self.context, "provider_manager"):
+                pm = self.context.provider_manager
+                if getattr(pm, "default_provider_id", None):
+                    provider = self.context.get_provider_by_id(pm.default_provider_id)
+            if not provider: return
+
+            call_kwargs = {
+                "prompt": prompt,
+                "image_urls": image_urls,
+                "session_id": None
+            }
+
+            custom_model = self.config.get("llm_model")
+            if custom_model: call_kwargs["model"] = custom_model
+            custom_base_url = self.config.get("llm_base_url")
+            if custom_base_url: call_kwargs["base_url"] = custom_base_url
+            # [新增] 注入 API KEY
+            custom_api_key = self.config.get("llm_api_key")
+            if custom_api_key: call_kwargs["api_key"] = custom_api_key
+
+            response = await provider.text_chat(**call_kwargs)
+            
+            # === 8. 解析结果 ===
+            raw_text = ""
+            if response and response.completion_text:
+                raw_text = response.completion_text.strip()
+            
+            result_match = re.search(r"RESULT:\s*(VIOLATION|SAFE)", raw_text, re.IGNORECASE)
+            reason_match = re.search(r"REASON:\s*(.+)", raw_text, re.IGNORECASE)
+            
+            is_violation = False
+            reason_str = "未说明理由"
+
+            if result_match and "VIOLATION" in result_match.group(1).upper():
+                is_violation = True
+            if not result_match and "VIOLATION" in raw_text.upper():
+                is_violation = True
+                
+            if reason_match:
+                reason_str = reason_match.group(1).strip()
+            elif is_violation:
+                reason_str = raw_text.split('\n')[0][:50]
+
+            # === 9. 判罚 ===
+            if is_violation:
+                logger.info(f"[ImageGuard] 违规命中: {reason_str} | URL: {image_urls[0]}")
+                await self.enforce_penalty(event, image_urls[0], is_group, reason_str)
+                
+        except Exception as e:
+            logger.error(f"[ImageGuard] Check failed: {e}")
+
+    async def enforce_penalty(self, event: AstrMessageEvent, violation_img_url: str, is_group: bool, reason: str):
+        """执行判罚 (全链路底层 API 直连)"""
+        user_id = event.get_sender_id()
+        group_id = event.get_group_id()
+        user_name = event.get_sender_name()
+        
+        recalled = False
+        banned = False
+        duration = self.config.get("ban_duration", 86400)
+
+        client = None
+        if hasattr(event, "bot"): client = event.bot
+        elif hasattr(event, "client"): client = event.client
+
+        if not client:
+            return
+
+        # A. 撤回消息
+        if self.config.get("enable_recall", True) and is_group:
+            try:
+                msg_id = None
+                if hasattr(event.message_obj, "message_id"):
+                    msg_id = event.message_obj.message_id
+                
+                if msg_id:
+                    await client.api.call_action('delete_msg', message_id=msg_id)
+                    recalled = True
+            except Exception as e:
+                logger.warning(f"[ImageGuard] Silent Recall failed: {e}")
+
+        # B. 禁言用户
+        if duration > 0 and is_group:
+            try:
+                await client.api.call_action(
+                    "set_group_ban",
+                    group_id=group_id,
+                    user_id=user_id,
+                    duration=duration
+                )
+                banned = True
+            except Exception as e:
+                logger.warning(f"[ImageGuard] Silent Ban failed: {e}")
+
+        # C. 上报证据 (私聊)
+        report_target = self.config.get("report_target_id")
+        if report_target:
+            try:
+                target_id = int(str(report_target).strip())
+                source_str = f"群 {group_id}" if is_group else "私聊"
+                status_str = f"撤回:{'✅' if recalled else '❌'} 禁言:{'✅' if banned else '❌'}"
+                
+                text_content = (
+                    f"🕵️ [静默执法报告]\n"
+                    f"来源: {source_str}\n"
+                    f"用户: {user_name} ({user_id})\n"
+                    f"理由: {reason}\n"
+                    f"状态: {status_str}\n"
+                    f"证据:"
+                )
+
+                message_payload = [
+                    {"type": "text", "data": {"text": text_content}},
+                    {"type": "image", "data": {"file": violation_img_url}}
+                ]
+
+                await client.api.call_action(
+                    "send_private_msg",
+                    user_id=target_id,
+                    message=message_payload
+                )
+
+            except Exception as e:
+                logger.error(f"[ImageGuard] Report failed: {e}")
