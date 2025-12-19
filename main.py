@@ -1,3 +1,4 @@
+import httpx
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
@@ -8,7 +9,7 @@ from .cache import DiskCache
 from .utils import extract_urls
 from pathlib import Path
 
-@register("web_analysis_pro", "YEZI", "深度网页解析Pro", "0.4.0")
+@register("web_analysis_pro", "YEZI", "深度网页解析Pro", "0.4.1")
 class WebAnalysisPlugin(Star):
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
@@ -35,9 +36,8 @@ class WebAnalysisPlugin(Star):
             },
             render_settings=config,
             domain_rules={
-                # 注意：这里需要解析 JSON 字符串，因为 schema 中定义为 text/json 编辑器
                 "site_rules": self._parse_json_config("site_rules_json"),
-                "allow": [], # 需要从配置解析
+                "allow": [], 
                 "deny": self._parse_json_config("domain_rules_json").get("deny", [])
             },
             cache=self.disk_cache,
@@ -68,15 +68,17 @@ class WebAnalysisPlugin(Star):
 
         for url in urls:
             logger.info(f"[WebAnalysis] Processing: {url}")
-            # 发送 "分析中..." 提示 (可选)
             
             # 1. 抓取与提取
-            # 注意：screenshot_mode 逻辑需要在 main 处理，这里简化
-            need_screenshot = self.config.get("screenshot_enabled", False)
+            # [Fix] 统一使用 screenshot_mode 判断
+            sc_mode = self.config.get("screenshot_mode", "off")
+            need_screenshot = (sc_mode == "always")
+            
             result = await self.analyzer.fetch_and_extract(url, need_screenshot=need_screenshot)
             
             if result.error:
-                logger.error(f"Analysis failed: {result.error}")
+                # 如果是静默失败模式可以 log warning，这里直接 log error
+                logger.warning(f"Analysis failed: {result.error}")
                 continue
                 
             # 2. 调用 LLM 总结
@@ -91,21 +93,57 @@ class WebAnalysisPlugin(Star):
                 yield event.chain_result(chain)
 
     async def _llm_summarize(self, result):
-        # ... 实现 LLM 调用逻辑，使用 result.text ...
-        # 参考 ImageGuard 的 provider 调用方式，但要换成 summary prompt
-        provider = self.context.get_using_provider()
-        if not provider: return f"网页标题: {result.title}\n(LLM未配置，无法总结)"
+        """
+        调用 LLM 生成摘要。
+        策略：优先使用 config 中定义的独立 LLM 配置；如果未配置，则回退到 context.get_using_provider()
+        """
+        prompt = self.config.get("analysis_prompt_template", "") + \
+                 f"\n\n标题: {result.title}\nURL: {result.final_url}\n内容:\n{result.text[:3000]}" # 3000字符截断
+
+        # 检查是否配置了独立 LLM
+        custom_key = self.config.get("llm_api_key")
+        custom_base = self.config.get("llm_base_url")
+        custom_model = self.config.get("llm_model")
+
+        if custom_key and custom_base:
+            # [Iron Rule] 使用独立配置调用 OpenAI 兼容接口
+            try:
+                async with httpx.AsyncClient(timeout=self.config.get("llm_timeout_sec", 60)) as client:
+                    payload = {
+                        "model": custom_model or "gpt-3.5-turbo",
+                        "messages": [
+                            {"role": "system", "content": self.config.get("analysis_prompt_user_persona", "")},
+                            {"role": "user", "content": prompt}
+                        ]
+                    }
+                    resp = await client.post(
+                        f"{custom_base.rstrip('/')}/v1/chat/completions", # 假设是兼容 OpenAI 的接口
+                        json=payload,
+                        headers={"Authorization": f"Bearer {custom_key}"}
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+                    return data["choices"][0]["message"]["content"]
+            except Exception as e:
+                logger.error(f"[WebAnalysis] Custom LLM failed: {e}, falling back to system provider.")
+                # 失败后继续向下执行，尝试使用系统默认 Provider
         
-        prompt = self.config.get("analysis_prompt_template", "") + f"\n\n标题: {result.title}\n内容:\n{result.text[:2000]}" # 截断防止超长
+        # 使用 AstrBot 全局 Provider
+        provider = self.context.get_using_provider()
+        if not provider: 
+            return f"网页标题: {result.title}\n(摘要失败：未配置 LLM)"
         
         try:
-            resp = await provider.text_chat(prompt=prompt, session_id=None)
+            resp = await provider.text_chat(
+                prompt=prompt, 
+                session_id=None,
+                system_prompt=self.config.get("analysis_prompt_user_persona", "")
+            )
             return resp.completion_text
         except Exception as e:
             return f"LLM 总结失败: {e}"
 
     async def terminate(self):
-        # 插件卸载时关闭资源
         if self.analyzer:
             await self.analyzer.shutdown()
         if self.render_client:
